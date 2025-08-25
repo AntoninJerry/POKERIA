@@ -49,6 +49,26 @@ def _scale_to_height(img, target_h=64):
     new_w = max(1, int(w * s))
     return cv2.resize(img, (new_w, target_h), interpolation=cv2.INTER_CUBIC)
 
+# ✅ Cette fonction est requise par state/builder.py
+def preprocess_digits(img_rgb):
+    """
+    Prétraitement simple/robuste pour montants (pot, stack).
+    - Gris + CLAHE
+    - Otsu (+ inversion si fond sombre)
+    - Petit nettoyage morpho
+    - Upscale à 64 px de haut
+    Retourne une image 1 canal binaire.
+    """
+    gray = to_gray(img_rgb)
+    gray = _clahe(gray)
+    g = cv2.GaussianBlur(gray, (3, 3), 0)
+    _, th = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    if gray.mean() < 127:
+        th = 255 - th
+    th = _morph_refine(th, open_k=(1,1), close_k=(2,2))
+    th = _scale_to_height(th, 64)
+    return th
+
 def preprocess_digits_variants(img_rgb):
     """
     Retourne plusieurs versions binaires/agrandies -> on choisit la meilleure à l'OCR.
