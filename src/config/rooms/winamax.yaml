@@ -66,3 +66,5 @@ rois_hint:
     - 0.926805
     - 0.532693
     - 0.073195
+table_meta:
+  seats_n: 5 
