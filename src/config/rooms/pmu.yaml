@@ -1,0 +1,9 @@
+# PMU room configuration
+# Relative ROIs (placeholder)
+room:
+  name: "pmu"
+  table_roi:
+    x: 0.0
+    y: 0.0
+    width: 1.0
+    height: 1.0
