@@ -1,9 +1,68 @@
-# Winamax room configuration
-# Relative ROIs (placeholder)
-room:
-  name: "winamax"
-  table_roi:
-    x: 0.0
-    y: 0.0
-    width: 1.0
-    height: 1.0
+room: winamax
+dpi_scale: 1.0
+table_roi:
+  left: 5
+  top: 24
+  width: 1667
+  height: 1011
+rois_hint:
+  hero_card_left:
+    rel:
+    - 0.455909
+    - 0.655786
+    - 0.025795
+    - 0.084075
+  hero_card_right:
+    rel:
+    - 0.481704
+    - 0.654797
+    - 0.027594
+    - 0.086053
+  board_card_1:
+    rel:
+    - 0.329934
+    - 0.320475
+    - 0.067786
+    - 0.167161
+  board_card_2:
+    rel:
+    - 0.39832
+    - 0.319486
+    - 0.066587
+    - 0.16815
+  board_card_3:
+    rel:
+    - 0.466707
+    - 0.318497
+    - 0.067187
+    - 0.171118
+  board_card_4:
+    rel:
+    - 0.535093
+    - 0.318497
+    - 0.068986
+    - 0.172107
+  board_card_5:
+    rel:
+    - 0.604679
+    - 0.319486
+    - 0.076785
+    - 0.172107
+  pot_amount:
+    rel:
+    - 0.457708
+    - 0.520277
+    - 0.195561
+    - 0.055391
+  hero_stack:
+    rel:
+    - 0.440312
+    - 0.7636
+    - 0.130174
+    - 0.051434
+  action_strip:
+    rel:
+    - 0.237552
+    - 0.926805
+    - 0.532693
+    - 0.073195
