@@ -3,13 +3,13 @@ from typing import List, Dict, Optional
 
 @dataclass
 class TableState:
-    hero_cards: List[str] = field(default_factory=list)      # ex: ["Ah","Kd"]
-    community_cards: List[str] = field(default_factory=list) # flop/turn/river
+    hero_cards: List[str] = field(default_factory=list)
+    community_cards: List[str] = field(default_factory=list)
     pot_size: float = 0.0
     hero_stack: float = 0.0
-    dealer_seat: Optional[int] = None   # 0..N-1 (btn seat)
-    hero_seat: Optional[int] = None     # index du siège du héros
+    dealer_seat: Optional[int] = None
+    hero_seat: Optional[int] = None
     seats_n: int = 6
-    # optionnel: dictionnaires
-    stacks: Dict[int, float] = field(default_factory=dict)   # seat->stack
-    actions: List[str] = field(default_factory=list)         # logs bruts
+    stacks: Dict[int, float] = field(default_factory=dict)
+    actions: List[str] = field(default_factory=list)
+    to_call: float = 0.0    # <<< montant à payer (€, si dispo)

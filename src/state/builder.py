@@ -1,4 +1,5 @@
 import cv2
+import re
 from src.config.settings import get_table_roi, load_room_config, ACTIVE_ROOM
 from src.capture.screen import capture_table
 from src.ocr.engine import EasyOCREngine
@@ -6,6 +7,7 @@ from src.ocr.cards import read_card
 from src.ocr.preprocess import preprocess_digits, to_rgb
 from src.state.models import TableState
 from src.tools.detect_dealer import main as detect_dealer  # tu as déjà la détection bouton
+from src.ocr.engine_singleton import get_engine
 
 def rel_to_abs(rel, W, H):
     rx, ry, rw, rh = rel
@@ -18,11 +20,34 @@ def crop_from_cfg(cfg, table_rgb, name):
     x,y,w,h = rel_to_abs(roi["rel"],W,H)
     return table_rgb[y:y+h, x:x+w].copy()
 
-def build_state() -> TableState:
+def _read_amount_any(engine, rgb):
+    # 1) tentative directe
+    try:
+        from src.ocr.preprocess import preprocess_digits, to_rgb
+        th = preprocess_digits(rgb)
+        res = engine.read_amount(to_rgb(th))
+        if res and res.get("value") is not None:
+            return float(res["value"])
+    except Exception:
+        pass
+    # 2) fallback regex (€, virgule décimale)
+    txt, conf, raw = engine.read_text(rgb, allowlist="0123456789,€. ")
+    m = re.findall(r"(\d{1,3}(?:[\s\.]\d{3})*|\d+)[,\.](\d{2})\s*€?", txt or "")
+    if m:
+        x = m[-1]  # on prend la dernière valeur trouvée (souvent la plus à droite)
+        whole = re.sub(r"[^\d]", "", x[0])
+        cents = x[1]
+        try:
+            return float(f"{whole}.{cents}")
+        except Exception:
+            return 0.0
+    return 0.0
+
+def build_state(engine: EasyOCREngine | None = None) -> TableState:
     table_rgb = capture_table(get_table_roi(ACTIVE_ROOM))
-    H,W = table_rgb.shape[:2]
+    H, W = table_rgb.shape[:2]
     cfg = load_room_config(ACTIVE_ROOM)
-    engine = EasyOCREngine(gpu=False)
+    engine = engine or get_engine()
 
     state = TableState(seats_n=cfg.get("table_meta",{}).get("seats_n",6))
 
@@ -55,6 +80,13 @@ def build_state() -> TableState:
         stk_res = engine.read_amount(to_rgb(stk_img))
         if stk_res["value"] is not None:
             state.hero_stack = stk_res["value"]
+            
+    act = crop_from_cfg(cfg, table_rgb, "action_strip")
+    if act is not None:
+        try:
+            state.to_call = float(_read_amount_any(engine, act) or 0.0)
+        except Exception:
+            state.to_call = 0.0
 
     # Dealer seat
     try:
@@ -72,3 +104,4 @@ def build_state() -> TableState:
         print("Dealer detection failed:", e)
 
     return state
+

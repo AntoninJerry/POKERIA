@@ -1,5 +1,6 @@
 # Python dependencies for POKERIA
 # Core
+requests>=2.31
 numpy>=1.26
 opencv-python>=4.9
 Pillow>=10.3
