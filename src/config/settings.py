@@ -3,6 +3,7 @@ from pathlib import Path
 import yaml
 from typing import Dict, Any, Optional
 from src.utils.geometry import Rect
+import os
 
 ROOT = Path(__file__).resolve().parents[2]
 ROOMS_DIR = ROOT / "src" / "config" / "rooms"
@@ -39,6 +40,17 @@ def save_room_config(data: Dict[str, Any], room: Optional[str] = None) -> None:
     p.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
 
 def get_table_roi(room: Optional[str] = None) -> Rect:
+    # Mode fenêtré/locké → rect client Win32
+    if os.getenv("POKERIA_WINDOWED", "0") == "1":
+        try:
+            from src.runtime.window_lock import LOCK
+            r = LOCK.get_rect()
+            if r:
+                return Rect(x=int(r["left"]), y=int(r["top"]), w=int(r["width"]), h=int(r["height"]))
+        except Exception:
+            pass  # fallback YAML si erreur
+
+    # Fallback profil YAML (plein écran ou pas de lock)
     cfg = load_room_config(room)
     t = cfg.get("table_roi", {})
     return Rect(
