@@ -1,78 +1,99 @@
+# src/ocr/engine.py
+from __future__ import annotations
 import re
-import cv2
 import numpy as np
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 
 class EasyOCREngine:
-    def __init__(self, gpu: bool = False, langs: List[str] = ['en']):
-        # import tardif pour éviter les coûts si non utilisé
+    """
+    Enveloppe EasyOCR avec utilitaires:
+      - read_text(img_rgb, allowlist=None) → (txt, conf, raw)
+      - read_amount(img_rgb, prefer_rightmost=True) → dict {text,value,conf,raw,joined}
+      - read_amount_from_variants(variants) → garde le meilleur des prétraitements
+    """
+    def __init__(self, gpu: bool = False, langs: List[str] = ('en',)):
+        # import tardif pour éviter le coût si module non utilisé ailleurs
         import easyocr
+        # model_storage_directory: dossier local (évite re-download)
         self.reader = easyocr.Reader(
-            langs, gpu=gpu, download_enabled=True, model_storage_directory='models/'
+            list(langs), gpu=gpu, download_enabled=True, model_storage_directory='models/'
+        )
+
+    # ─────────── helpers parsing ───────────
+    @staticmethod
+    def _postfix_common_ocr_errors(s: str) -> str:
+        """
+        Corrections simples pour confusions fréquentes.
+        """
+        return (
+            s.replace('O', '0')
+             .replace('o', '0')
+             .replace('S', '5')
+             .replace('€', '')
+             .replace(' ', '')
         )
 
     @staticmethod
-    def _postfix_common_ocr_errors(s: str) -> str:
-        # corrections courantes
-        s = s.replace('O', '0')
-        s = s.replace('o', '0')
-        s = s.replace('S', '5')
-        s = s.replace('€', '')
-        s = s.replace(' ', '')
-        return s
-
-    @staticmethod
     def _parse_amount(txt: str) -> Optional[float]:
+        """
+        '1.234,56' → 1234.56 ; '12,3' → 12.3 ; '12.3' → 12.3
+        """
         if not txt:
             return None
         t = EasyOCREngine._postfix_common_ocr_errors(txt)
-        # garder seulement chiffres .,,
-        t = re.sub(r'[^0-9\.,]', '', t)
+        t = re.sub(r'[^0-9\.,]', '', t)  # garde chiffres/.,
 
-        # cas EU: "1.234,56" → "1234.56"
         if ',' in t and '.' in t:
+            # style EU avec milliers: 1.234,56 → 1234.56
             t = t.replace('.', '').replace(',', '.')
         elif ',' in t:
             t = t.replace(',', '.')
+
         try:
             return float(t)
         except Exception:
             return None
 
-    def read_text(self, img_rgb, allowlist: Optional[str] = None):
+    # ─────────── API OCR générique ───────────
+    def read_text(self, img_rgb, allowlist: Optional[str] = None) -> Tuple[str, float, list]:
         """
-        Retourne (text_concat, conf_moy, raw_results).
+        Retourne (texte_concaténé, confiance_moyenne, résultats_bruts).
         """
+        # EasyOCR attend 3 canaux; si binaire 1 canal, il gère mais on laisse simple ici.
         kw = dict(detail=1, paragraph=False)
         if allowlist is not None:
             kw["allowlist"] = allowlist
         results = self.reader.readtext(img_rgb, **kw)
         if not results:
             return "", 0.0, []
-        texts = [t for (_, t, _) in results]
-        confs = [float(c) for (_, _, c) in results]
+        texts = [t for (_b, t, _c) in results if t]
+        confs = [float(c) for (_b, _t, c) in results] or [0.0]
         return " ".join(texts), float(np.mean(confs)), results
 
-    def read_amount(self, img_rgb, prefer_rightmost: bool = True):
-        import re
+    # ─────────── OCR montants (avec heuristiques) ───────────
+    def read_amount(self, img_rgb, prefer_rightmost: bool = True) -> Dict[str, Any]:
+        """
+        Lit un montant en € dans une zone.
+        Heuristique de choix:
+          1) token avec décimales (xx,y / xx.y) prioritaire
+          2) parmi ceux-ci, le plus à droite (souvent pot/stack)
+          3) sinon, meilleure confiance
+        Retour dict: {"text","value","conf","raw","joined"}.
+        """
         results = self.reader.readtext(
             img_rgb, detail=1, paragraph=False, allowlist="0123456789€,."
         )
-        joined = " ".join([t for (_, t, _) in results]) if results else ""
+        joined = " ".join([t for (_box, t, _c) in results]) if results else ""
 
-        # extraire des candidats par token
-        cands = []
+        candidates = []
         for (box, t, conf) in results:
-            raw = t
-            t = self._postfix_common_ocr_errors(t)
+            raw_t = t or ""
+            t = self._postfix_common_ocr_errors(raw_t)
             t = re.sub(r"[^0-9\.,]", "", t)
             if not t:
                 continue
 
-            # marqueur "a un séparateur décimal"
-            has_dec = bool(re.search(r"\d+[\.,]\d{1,2}$", t))
-
-            # normalisation EU -> float
+            has_dec = bool(re.search(r"\d+[\.,]\d{1,2}$", t))  # finit par décimales (1 ou 2)
             tt = t
             if "," in tt and "." in tt:
                 tt = tt.replace(".", "").replace(",", ".")
@@ -84,21 +105,45 @@ class EasyOCREngine:
             except Exception:
                 continue
 
-            xs = [p[0] for p in box]
-            x_center = float(sum(xs) / len(xs))
-            cands.append({
-                "raw": raw, "clean": t, "value": val,
+            xs = [p[0] for p in box]  # x-coords
+            x_center = float(sum(xs) / max(1, len(xs)))
+            candidates.append({
+                "raw": raw_t, "clean": t, "value": val,
                 "conf": float(conf), "x": x_center, "has_dec": has_dec
             })
 
-        if cands:
-            # Règle: (1) préfère un token avec décimales, (2) le plus à droite, (3) meilleure confiance
-            cands.sort(key=lambda d: (not d["has_dec"], -d["x"] if prefer_rightmost else d["x"], -d["conf"]))
-            best = cands[0]
-            return {"text": best["raw"], "value": best["value"], "conf": best["conf"], "raw": results, "joined": joined}
+        if candidates:
+            # tri multi-clés
+            candidates.sort(key=lambda d: (
+                not d["has_dec"],
+                -d["x"] if prefer_rightmost else d["x"],
+                -d["conf"]
+            ))
+            best = candidates[0]
+            return {
+                "text": best["raw"],
+                "value": best["value"],
+                "conf": best["conf"],
+                "raw": results,
+                "joined": joined
+            }
 
-        # fallback concaténé (rare)
+        # fallback: concat global
         txt, conf, raw = self.read_text(img_rgb, allowlist="0123456789€,.")
         val = self._parse_amount(txt)
         return {"text": txt, "value": val, "conf": conf, "raw": raw, "joined": txt}
 
+    def read_amount_from_variants(self, variants: List[np.ndarray], prefer_rightmost: bool = True) -> Dict[str, Any]:
+        """
+        Donne plusieurs versions prétraitées (binaire/upscale) → renvoie la meilleure lecture.
+        """
+        best: Dict[str, Any] = {"conf": -1.0, "value": None}
+        for v in variants:
+            out = self.read_amount(v, prefer_rightmost=prefer_rightmost)
+            # priorité à une valeur non-nulle et/ou meilleure confiance
+            score = (1 if out.get("value") is not None else 0, float(out.get("conf", 0.0)))
+            if score > (1 if best.get("value") is not None else 0, float(best.get("conf", 0.0))):
+                best = out
+        if best["conf"] < 0:  # rien lu
+            return {"text": "", "value": None, "conf": 0.0, "raw": [], "joined": ""}
+        return best
