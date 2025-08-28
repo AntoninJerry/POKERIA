@@ -8,6 +8,32 @@ from src.ocr.preprocess import preprocess_digits, to_rgb
 from src.state.models import TableState
 from src.tools.detect_dealer import main as detect_dealer  # tu as déjà la détection bouton
 from src.ocr.engine_singleton import get_engine
+from src.ocr.preprocess import preprocess_digits_variants, to_rgb
+
+def _read_amount_variants(engine, crop_rgb):
+    """
+    Essaie plusieurs binarisations/variants pour lire un montant.
+    Retourne float(value) ou 0.0 si tout échoue.
+    Attend que engine.read_amount(...) renvoie au minimum:
+      - {"value": <float|str>, "conf": <0..1>}
+    """
+    best = None
+    for th in preprocess_digits_variants(crop_rgb):
+        res = engine.read_amount(to_rgb(th))
+        if not res:
+            continue
+        val = res.get("value", None)
+        try:
+            if val is None:
+                continue
+            v = float(val)
+            c = float(res.get("conf", 0.0))
+        except Exception:
+            continue
+        if (best is None) or (c > best["conf"]):
+            best = {"value": v, "conf": c}
+    return best["value"] if best is not None else 0.0
+
 
 def rel_to_abs(rel, W, H):
     rx, ry, rw, rh = rel
@@ -55,31 +81,27 @@ def build_state(engine: EasyOCREngine | None = None) -> TableState:
     for n in ["hero_card_left","hero_card_right"]:
         crop = crop_from_cfg(cfg,table_rgb,n)
         if crop is not None:
-            val,meta = read_card(engine,crop,n)
+            card, meta = read_card(engine, crop, n, cfg)
+            val,meta = read_card(engine,crop,n, cfg)
             if val: state.hero_cards.append(val)
 
     # Board cards
     for n in ["board_card_1","board_card_2","board_card_3","board_card_4","board_card_5"]:
         crop = crop_from_cfg(cfg,table_rgb,n)
         if crop is not None:
-            val,meta = read_card(engine,crop,n)
+            card, meta = read_card(engine, crop, n, cfg)
+            val,meta = read_card(engine,crop,n, cfg)
             if val: state.community_cards.append(val)
 
     # Pot
-    crop = crop_from_cfg(cfg,table_rgb,"pot_amount")
+    crop = crop_from_cfg(cfg, table_rgb, "pot_amount")
     if crop is not None:
-        pot_img = preprocess_digits(crop)
-        pot_res = engine.read_amount(to_rgb(pot_img))
-        if pot_res["value"] is not None:
-            state.pot_size = pot_res["value"]
+        state.pot_size = _read_amount_variants(engine, crop)
 
-    # Hero stack
-    crop = crop_from_cfg(cfg,table_rgb,"hero_stack")
+    crop = crop_from_cfg(cfg, table_rgb, "hero_stack")
     if crop is not None:
-        stk_img = preprocess_digits(crop)
-        stk_res = engine.read_amount(to_rgb(stk_img))
-        if stk_res["value"] is not None:
-            state.hero_stack = stk_res["value"]
+        state.hero_stack = _read_amount_variants(engine, crop)
+
             
     act = crop_from_cfg(cfg, table_rgb, "action_strip")
     if act is not None:

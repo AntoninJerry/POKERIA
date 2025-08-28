@@ -1,196 +1,205 @@
 # src/ocr/cards.py
-import cv2, numpy as np
-from typing import Optional, Tuple, Dict
+import os, cv2, numpy as np
+from typing import Optional, Tuple, Dict, List
 from src.ocr.engine import EasyOCREngine
 from src.ocr.suit_shape import SuitHu
+from src.ocr.template_match import load_templates_from_dir, best_match_rank
+from src.ocr.template_match import load_suit_templates_from_dir, best_match_suit
+
+
+# ====== CONSTANTES ======
+RANK_ALLOW = "23456789TJQKA"
+RANK_SET = set(RANK_ALLOW)
+SUITS = ("h","d","s","c")
 
 _SUITS_HU = SuitHu()
 
-RANK_ALLOW = "0123456789TJQKA"
-RANK_SET = set("23456789TJQKA")
+# banque de templates rangs, chargée lazy
+_RANK_TEMPLATES: Dict[str, List[np.ndarray]] = {}
+
+def _ensure_rank_bank():
+    global _RANK_TEMPLATES
+    if _RANK_TEMPLATES:
+        return
+    root = os.getenv("POKERIA_RANKS_DIR", "assets/templates/ranks")
+    _RANK_TEMPLATES = load_templates_from_dir(root, list(RANK_ALLOW))
+    # Optionnel: avertir si vide
+    if not _RANK_TEMPLATES:
+        print(f"[cards] WARN: aucune template de rang trouvée dans {root}")
+
+
+_SUIT_TEMPLATES = {}
+def _ensure_suit_bank():
+    global _SUIT_TEMPLATES
+    if _SUIT_TEMPLATES: return
+    root = os.getenv("POKERIA_SUITS_DIR","assets/templates/suits")
+    _SUIT_TEMPLATES = load_suit_templates_from_dir(root)
+    if not any(_SUIT_TEMPLATES.values()):
+        print(f"[cards] WARN: aucune template de suit trouvée dans {root}")
 
 # ----------------- utils -----------------
-def _nonempty(img):
+def _nonempty(img) -> bool:
     return img is not None and hasattr(img, "size") and img.size > 0 and img.shape[0] > 0 and img.shape[1] > 0
 
-def _is_small_roi(w, h):  # si tu passes déjà un coin ou une petite sous-zone
-    return w < 40 or h < 40 or (w * h) <= 2000
-
-def _roi_from_rel(img_rgb, rel):
-    """Découpe une sous-ROI relative [rx,ry,rw,rh] dans img_rgb."""
-    if not _nonempty(img_rgb) or not rel: return None
-    h, w = img_rgb.shape[:2]
+def _roi_from_rel(parent_rgb, rel) -> Optional[np.ndarray]:
+    if not rel: return None
+    H, W = parent_rgb.shape[:2]
     rx, ry, rw, rh = rel
-    x, y = int(rx * w), int(ry * h)
-    ww, hh = max(1, int(rw * w)), max(1, int(rh * h))
-    x = max(0, min(x, w - 1)); y = max(0, min(y, h - 1))
-    ww = max(1, min(ww, w - x)); hh = max(1, min(hh, h - y))
-    return img_rgb[y:y + hh, x:x + ww].copy()
+    x = max(0, min(int(rx * W), W - 1))
+    y = max(0, min(int(ry * H), H - 1))
+    w = max(1, min(int(rw * W), W - x))
+    h = max(1, min(int(rh * H), H - y))
+    return parent_rgb[y:y+h, x:x+w].copy()
 
-# ----------------- prétraitements -----------------
-def _prep_bin_otsu(img_rgb, target_h=140):
+def _prep_rank_bin(img_rgb, target_h=160) -> np.ndarray:
     gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
     gray = cv2.createCLAHE(3.0, (8, 8)).apply(gray)
     g = cv2.GaussianBlur(gray, (3, 3), 0)
-    _, th = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    th = cv2.adaptiveThreshold(g, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                               cv2.THRESH_BINARY, 31, 5)
     if gray.mean() < 127: th = 255 - th
     h, w = th.shape[:2]; s = target_h / max(1.0, h)
     return cv2.resize(th, (max(1, int(w * s)), int(target_h)), interpolation=cv2.INTER_CUBIC)
 
-def _prep_bin_adapt(img_rgb, target_h=140):
-    gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
-    gray = cv2.createCLAHE(3.0, (8, 8)).apply(gray)
-    g = cv2.GaussianBlur(gray, (3, 3), 0)
-    th = cv2.adaptiveThreshold(g, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 5)
-    if gray.mean() < 127: th = 255 - th
-    h, w = th.shape[:2]; s = target_h / max(1.0, h)
-    return cv2.resize(th, (max(1, int(w * s)), int(target_h)), interpolation=cv2.INTER_CUBIC)
+def _suit_color_hint(rgb) -> str:
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    m1 = cv2.inRange(hsv, (0, 70, 40), (10, 255, 255))
+    m2 = cv2.inRange(hsv, (170, 70, 40), (180, 255, 255))
+    red_ratio = float(np.count_nonzero(m1 | m2)) / (rgb.shape[0] * rgb.shape[1] + 1e-6)
+    return "red" if red_ratio > 0.04 else "black"
 
-# ----------------- heuristiques rang/suit -----------------
-def _rank_q_vs_9(corner_rgb, rank_code, alt_code, margin: float):
-    if {rank_code, alt_code} != {"Q", "9"} or margin >= 0.05: return rank_code
-    h, w = corner_rgb.shape[:2]
-    br = corner_rgb[int(0.60 * h):h, int(0.55 * w):w]
-    if not _nonempty(br): return rank_code
-    th = _prep_bin_otsu(br, target_h=80)
-    black_ratio = float(np.count_nonzero(255 - th)) / (th.size + 1e-6)
-    return "Q" if black_ratio > 0.20 else "9"
+def _rank_cleanup(raw: str) -> str:
+    s = (raw or "").upper().replace(" ", "")
+    s = s.replace("10", "T").replace("IO", "T").replace("TO", "T").replace("I0", "T")
+    for ch in s:
+        if ch in RANK_SET:
+            return ch
+    return ""
 
-def _suit_by_color(corner_rgb) -> str:
-    hsv = cv2.cvtColor(corner_rgb, cv2.COLOR_RGB2HSV)
-    mask1 = cv2.inRange(hsv, (0, 70, 40), (10, 255, 255))
-    mask2 = cv2.inRange(hsv, (170, 70, 40), (180, 255, 255))
-    red_ratio = float(np.count_nonzero(mask1 | mask2)) / (corner_rgb.shape[0] * corner_rgb.shape[1] + 1e-6)
-    return "red" if red_ratio > 0.05 else "black"
+def _q_vs_9_heuristic(bin_patch: np.ndarray, guess: str) -> str:
+    if guess not in ("Q", "9"): return guess
+    img = cv2.morphologyEx(bin_patch, cv2.MORPH_ERODE, np.ones((2,2), np.uint8), iterations=1)
+    cnts, _ = cv2.findContours(img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts: return guess
+    cnt = max(cnts, key=cv2.contourArea)
+    rect = cv2.minAreaRect(cnt)
+    (w, h) = rect[1]
+    if w < 1 or h < 1: return guess
+    aspect = float(min(w, h) / max(w, h))
+    return "Q" if aspect < 0.45 else guess
 
-def _suit_patch_auto(corner_rgb):
-    """
-    Cherche le symbole dans la moitié droite du coin TL.
-    - ROI droite (0..80% H, 40..100% L)
-    - Otsu + plus gros contour
-    - fallback: bloc fixe (0..75% H, 45..100% L)
-    """
-    h, w = corner_rgb.shape[:2]
-    x1, y1, x2, y2 = int(0.40 * w), 0, w, int(0.80 * h)
-    if x2 <= x1 or y2 <= y1:
-        return None
-    right = corner_rgb[y1:y2, x1:x2].copy()
-
-    th = _prep_bin_otsu(right, target_h=120)
-    try:
-        contours, _ = cv2.findContours(255 - th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    except Exception:
-        contours = []
-
-    if contours:
-        c = max(contours, key=cv2.contourArea)
-        x, y, ww, hh = cv2.boundingRect(c)
-        if ww * hh >= 16:  # filtre bruit
-            ys1 = max(0, y - 2); ys2 = min(th.shape[0], y + hh + 2)
-            xs1 = max(0, x - 2); xs2 = min(th.shape[1], x + ww + 2)
-            return right[ys1:ys2, xs1:xs2].copy()
-
-    # fallback fixe si pas de contour utilisable
-    fx1, fy2 = int(0.45 * w), int(0.75 * h)
-    if fx1 < w and fy2 > 0:
-        return corner_rgb[0:fy2, fx1:w].copy()
-    return None
-
-# ----------------- OCR rang -----------------
+# ----------------- RANK -----------------
 def _read_rank(engine: EasyOCREngine, rank_rgb) -> Tuple[Optional[str], float, Dict]:
-    variants = [_prep_bin_otsu(rank_rgb, 160), _prep_bin_adapt(rank_rgb, 160)]
-    best = None
-    for i, th in enumerate(variants):
-        img3 = cv2.cvtColor(th, cv2.COLOR_GRAY2RGB)
-        txt, conf, raw = engine.read_text(img3, allowlist=RANK_ALLOW)
-        toks = [t for (_b, t, _c) in (raw or []) if t and t.strip()]
-        guess = "".join(toks or [txt or ""]).upper().replace(" ", "")
-        guess = guess.replace("I", "1").replace("O", "0").replace("D", "Q")
-        if "10" in guess: rank = "T"
-        elif guess and guess[0] in RANK_SET: rank = guess[0]
-        else: rank = None
-        if rank and (best is None or conf > best["conf"]):
-            best = {"rank": rank, "conf": float(conf), "var": i}
-    if best: return best["rank"], best["conf"], best
-    return None, 0.0, {}
+    if not _nonempty(rank_rgb):
+        return None, 0.0, {"error": "empty_rank"}
+
+    # OCR (whitelist)
+    bin1 = _prep_rank_bin(rank_rgb, 160)
+    txt, conf, raw = engine.read_text(cv2.cvtColor(bin1, cv2.COLOR_GRAY2RGB), allowlist=RANK_ALLOW)
+    toks = [t for (_b, t, _c) in (raw or []) if t and t.strip()]
+    guess = _rank_cleanup("".join(toks or [txt or ""]))
+    best_code, best_conf, best_meta = guess if guess in RANK_SET else None, float(conf or 0.0), {"bin": bin1, "src": "ocr"}
+
+    # Tie-break Q vs 9 si conf moyenne
+    if best_code in ("Q","9") and best_conf < 0.88:
+        best_code = _q_vs_9_heuristic(bin1, best_code)
+
+    # Fallback templates si doute (ou None)
+    if (best_code is None) or (best_conf < 0.88) or (best_code in ("Q","9") and best_conf < 0.97):
+        _ensure_rank_bank()
+        if _RANK_TEMPLATES:
+            lab, score = best_match_rank(rank_rgb, _RANK_TEMPLATES, (0.7,0.85,1.0))
+            if lab in RANK_SET and score >= 0.58:
+                best_code, best_conf, best_meta = lab, max(best_conf, min(0.99, 0.85 + score*0.15)), {"tm_score": score, "src": "tm"}
+
+    return best_code, best_conf, best_meta
+
+# ----------------- SUIT -----------------
+def _read_suit(suit_rgb) -> Tuple[Optional[str], float, Dict]:
+    if not _nonempty(suit_rgb):
+        return None, 0.0, {"error": "empty_suit"}
+
+    hint = _suit_color_hint(suit_rgb)
+
+    # 1) Classif. HU
+    try:
+        lab, conf, meta = _SUITS_HU.classify(suit_rgb, color_hint=hint)
+    except TypeError:
+        tmp = _SUITS_HU.classify(suit_rgb)
+        lab, conf = (tmp[0], float(tmp[1])) if isinstance(tmp, (list, tuple)) and len(tmp) >= 2 else (None, 0.0)
+        meta = {}
+
+    conf = float(conf or 0.0)
+    meta = meta or {}
+
+    # 2) Fallback TM si invalide ou confiance trop faible
+    if (lab not in SUITS) or (conf < 0.70):
+        try:
+            _ensure_suit_bank()
+            # filtre par couleur: rouge -> {h,d} ; noir -> {s,c}
+            targ = ("h", "d") if hint == "red" else ("s", "c")
+            bank = {k: v for k, v in _SUIT_TEMPLATES.items() if k in targ and v}
+
+            if bank:
+                lab_tm, sc = best_match_suit(suit_rgb, bank)  # -> (label, score[0..1])
+                if (lab_tm in SUITS) and (sc is not None) and (sc >= 0.58):
+                    # rehausse de confiance en douceur, capée à 0.99
+                    blended = min(0.99, 0.85 + float(sc) * 0.15)
+                    conf = max(conf, blended)
+                    lab = lab_tm
+                    meta = {**meta, "tm_suit_score": float(sc), "src_suit": "tm"}
+        except Exception as e:
+            # on n'écrase rien si le fallback plante; on log juste l'erreur
+            meta = {**meta, "tm_error": str(e)}
+
+    if lab in SUITS:
+        return lab, conf, {"color_hint": hint, **meta}
+
+    # rien de concluant
+    return None, conf, {"color_hint": hint, **meta}
+# ----------------- défauts si pas de sous-ROIs -----------------
+def _default_rank_rel() -> Tuple[float,float,float,float]:
+    return (0.02, 0.02, 0.52, 0.56)
+
+def _default_suit_rel() -> Tuple[float,float,float,float]:
+    return (0.56, 0.06, 0.38, 0.44)
 
 # ----------------- API -----------------
-def read_card(
-    engine: EasyOCREngine,
-    crop_rgb,
-    roi_name: Optional[str] = None,
-    cfg: Optional[dict] = None
-):
-    """
-    Lit une carte à partir d'un crop (carte entière ou coin).
-    - Si cfg['rois_hint'][roi_name]['rank_rel'] existe -> on lit le rang dedans.
-    - Si cfg['rois_hint'][roi_name]['suit_rel'] existe -> on lit le symbole dedans.
-    - Sinon, extraction auto (coin TL pour rang, recherche symbole côté droit).
-    """
+def read_card(engine: EasyOCREngine, crop_rgb, roi_name: Optional[str] = None, cfg: Optional[dict] = None):
     if not _nonempty(crop_rgb):
         return None, {"roi_name": roi_name, "error": "empty"}
 
     h, w = crop_rgb.shape[:2]
-    small = _is_small_roi(w, h)
 
-    # --- RANK patch ---
+    # RANK
     rank_patch = None
     if cfg and roi_name:
         rank_rel = (cfg.get("rois_hint", {}).get(roi_name, {}) or {}).get("rank_rel")
-        if rank_rel:
-            rank_patch = _roi_from_rel(crop_rgb, rank_rel)
-
+        if rank_rel: rank_patch = _roi_from_rel(crop_rgb, rank_rel)
     if rank_patch is None:
-        # coin TL si carte entière, sinon on suppose que crop_rgb est déjà focalisé
-        rank_patch = crop_rgb.copy() if small else crop_rgb[0:int(0.55 * h), 0:int(0.60 * w)].copy()
+        rx, ry, rw, rh = _default_rank_rel()
+        rank_patch = crop_rgb[int(ry*h):int((ry+rh)*h), int(rx*w):int((rx+rw)*w)].copy()
 
-    if not _nonempty(rank_patch):
-        return None, {"roi_name": roi_name, "error": "rank_patch"}
-
-    # --- OCR rang ---
     r_code, r_conf, r_meta = _read_rank(engine, rank_patch)
 
-    # --- SUIT patch ---
+    # SUIT
     suit_patch = None
     if cfg and roi_name:
         suit_rel = (cfg.get("rois_hint", {}).get(roi_name, {}) or {}).get("suit_rel")
-        if suit_rel:
-            suit_patch = _roi_from_rel(crop_rgb, suit_rel)
-
+        if suit_rel: suit_patch = _roi_from_rel(crop_rgb, suit_rel)
     if suit_patch is None:
-        # extraction auto depuis le "coin" (zone rang/symbole)
-        corner = crop_rgb.copy() if small else crop_rgb[0:int(0.55 * h), 0:int(0.60 * w)].copy()
-        color_hint = _suit_by_color(corner)  # "red"/"black"
-        suit_patch = _suit_patch_auto(corner)
-        if not _nonempty(suit_patch):
-            # fallback couleur si on n'a rien de propre
-            s_code = "h" if color_hint == "red" else "s"
-            s_conf = 0.5
-            s_meta = {"reason": "no_suit_patch"}
-        else:
-            s_code, s_conf, s_meta = _SUITS_HU.classify(suit_patch, color_hint=color_hint)
-            if s_code is None:
-                s_code = "h" if color_hint == "red" else "s"
-                s_conf = 0.5
-                s_meta = {"reason": "classify_none"}
-    else:
-        # zone manuelle -> pas besoin du hint couleur
-        s_code, s_conf, s_meta = _SUITS_HU.classify(suit_patch, color_hint=None)
-        if s_code is None:
-            s_code, s_conf, s_meta = "s", 0.5, {"reason": "cfg_fallback"}
+        sx, sy, sw, sh = _default_suit_rel()
+        suit_patch = crop_rgb[int(sy*h):int((sy+sh)*h), int(sx*w):int((sx+sw)*w)].copy()
 
-    # --- Tie-break Q vs 9 si faible confiance rang ---
-    if r_code in ("Q", "9") and r_meta.get("conf", 0.0) < 0.7:
-        # On utilise le patch où le rang a été lu (rank_patch)
-        r_code = _rank_q_vs_9(rank_patch, r_code, "Q" if r_code == "9" else "9", 0.0)
+    s_code, s_conf, s_meta = _read_suit(suit_patch)
+
+    # Dernière sécurité Q/9
+    if r_code in ("Q","9") and "bin" in r_meta and r_conf < 0.88:
+        r_code = _q_vs_9_heuristic(r_meta["bin"], r_code)
 
     card = f"{r_code}{s_code}" if (r_code and s_code) else None
     return card, {
         "roi_name": roi_name,
-        "rank_code": r_code,
-        "rank_conf": r_conf,
-        **{k: v for k, v in r_meta.items() if k != "rank_patch"},
-        "suit_code": s_code,
-        "suit_conf": s_conf,
-        **(s_meta or {})
+        "rank_code": r_code, "rank_conf": r_conf, **{k:v for k,v in r_meta.items() if k != "rank_patch"},
+        "suit_code": s_code, "suit_conf": s_conf, **(s_meta or {})
     }

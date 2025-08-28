@@ -7,14 +7,28 @@ from src.ocr.engine_singleton import get_engine
 from src.featurize.features import featurize
 from src.policy.ollama_client import ask_policy
 from src.policy.postprocess import finalize_action
-from src.runtime.window_lock import LOCK  # ← ajout demandé
+from src.runtime.window_lock import LOCK  # suivi fenêtres/lock
 
 # ---------- Config ----------
-REFRESH_MS        = int(os.getenv("POKERIA_REFRESH_MS", "1000"))  # 1s par défaut
+REFRESH_MS        = int(os.getenv("POKERIA_REFRESH_MS", "1000"))
 POLICY_PERIOD_S   = float(os.getenv("POKERIA_POLICY_PERIOD", "2.5"))
-MANUAL_ONLY       = os.getenv("POKERIA_MANUAL_ONLY", "0") == "1"          # démarre en mode MANUEL si 1
-FOLLOW_ROI        = os.getenv("POKERIA_OVERLAY_FOLLOW_ROI", "1") == "1"   # suit la table si possible
-COLORBLIND        = os.getenv("POKERIA_COLORBLIND", "0") == "1"           # palette daltonisme
+MANUAL_ONLY       = os.getenv("POKERIA_MANUAL_ONLY", "0") == "1"
+FOLLOW_ROI        = os.getenv("POKERIA_OVERLAY_FOLLOW_ROI", "1") == "1"
+COLORBLIND        = os.getenv("POKERIA_COLORBLIND", "0") == "1"
+
+# ☑️ Fond configurable
+PANEL_RGB_STR     = os.getenv("POKERIA_PANEL_RGB", "0,0,0")  # ex: "20,20,24"
+try:
+    _r,_g,_b = [int(x.strip()) for x in PANEL_RGB_STR.split(",")]
+    _r=_r%256; _g=_g%256; _b=_b%256
+except Exception:
+    _r,_g,_b = (0,0,0)
+try:
+    _op = float(os.getenv("POKERIA_PANEL_OPACITY","0.55"))
+    _op = max(0.0, min(_op, 1.0))
+except Exception:
+    _op = 0.55
+PANEL_BG_CSS = f"background: rgba({_r},{_g},{_b},{_op});"
 
 PALETTE_DEFAULT = {
     "raise":   {"accent": "#16a34a"},
@@ -24,7 +38,7 @@ PALETTE_DEFAULT = {
     "all-in":  {"accent": "#a21caf"},
     "none":    {"accent": "#9ca3af"},
 }
-PALETTE_CB = {  # daltonisme
+PALETTE_CB = {
     "raise":   {"accent": "#3b82f6"},
     "call":    {"accent": "#fb923c"},
     "check":   {"accent": "#a78bfa"},
@@ -58,8 +72,8 @@ class Worker(QtCore.QObject):
     def run(self):
         ocr_t0 = time.perf_counter()
 
-        # ----- Garde-fou foreground/minimized -----
-        from src.runtime.window_lock import LOCK  # ← demandé
+        # Garde-fou foreground/minimized (quand exigé)
+        from src.runtime.window_lock import LOCK
         if os.getenv("POKERIA_REQUIRE_FOREGROUND","1") == "1":
             st_lock = LOCK.get_status()
             if st_lock.locked and (LOCK.is_minimized() or not LOCK.is_foreground()):
@@ -72,13 +86,11 @@ class Worker(QtCore.QObject):
                 ))
                 self.finished.emit()
                 return
-        # -----------------------------------------
 
         try:
             eng = get_engine()
             st = build_state(engine=eng)
 
-            # Prépare l'affichage état
             hero    = st.hero_cards[:]
             board   = st.community_cards[:]
             pot     = float(getattr(st, "pot_size", 0.0) or 0.0)
@@ -86,19 +98,15 @@ class Worker(QtCore.QObject):
             to_call = float(getattr(st, "to_call", 0.0) or 0.0)
             dealer  = getattr(st, "dealer_seat", None)
 
-            # Signature d'état
             sig = f"{' '.join(hero)}|{' '.join(board)}|{to_call:.2f}|{pot:.2f}"
 
-            # Debug ROIs (si dispo)
             debug_rois = []
             if self.want_debug_rois:
                 try:
-                    # attendu: [(x,y,w,h,label), ...] en coords écran
-                    debug_rois = eng.get_debug_rois()
+                    debug_rois = eng.get_debug_rois()  # [(x,y,w,h,label), ...]
                 except Exception:
                     debug_rois = []
 
-            # ROI/table rect (pour follow ROI)
             table_rect = None
             try:
                 if hasattr(eng, "get_table_rect"):
@@ -110,7 +118,6 @@ class Worker(QtCore.QObject):
             except Exception:
                 table_rect = None
 
-            # Décide si on appelle la policy ici
             do_policy = self.force_policy or (self.allow_policy and (sig != self.last_sig) and len(hero) >= 2)
 
             action = None
@@ -146,52 +153,44 @@ class Overlay(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
 
-        # ⚠️ pas de AA_UseSoftwareOpenGL ici (on le met dans run() avant QApplication)
-
-        # ----- Bandeau statut (init + refresh immédiat) -----
+        # ====== Bandeau statut compact (Room/Window/LOCK/FOLLOW/PAUSED) ======
         self.win_status = QtWidgets.QLabel(self)
         self.win_status.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, True)
         self.win_status.setStyleSheet("color: white; background: rgba(0,0,0,120); padding: 3px; font-size: 11px;")
+        self.status_max_w = int(os.getenv("POKERIA_STATUS_MAX_W", "420"))
+        self.win_status.setFixedSize(self.status_max_w, 22)
         self.win_status.move(12, 8)
-        self.win_status.resize(900, 22)
 
-        # Raccourcis fenêtres F6/F7
+        # F6 cycle / F7 lock
         QtGui.QShortcut(QtGui.QKeySequence("F6"), self, activated=self.on_cycle_window)
         QtGui.QShortcut(QtGui.QKeySequence("F7"), self, activated=self.on_toggle_lock)
 
-        # Rafraîchir la liste tout de suite (pour éviter unknown/none)
         try:
-            LOCK.refresh()
+            LOCK.refresh()  # refresh immédiat pour éviter "unknown/none"
         except Exception:
             pass
 
-        # Timer statut périodique
         self.status_timer = QtCore.QTimer(self)
         self.status_timer.setInterval(400)
         self.status_timer.timeout.connect(self._tick_win_status)
         self.status_timer.start()
-        # ----------------------------------------------------
+        # =====================================================================
 
         self.setWindowTitle("PokerIA HUD")
         self.setWindowFlag(QtCore.Qt.FramelessWindowHint, True)
         self.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
 
-        # Translucide / Opaque
-        if os.getenv("POKERIA_OVERLAY_OPAQUE", "0") == "1":
-            self.setAttribute(QtCore.Qt.WA_TranslucentBackground, False)
-            self.setWindowOpacity(0.98)
-            panel_bg = "background: rgba(0,0,0,0.70);"
-        else:
-            self.setAttribute(QtCore.Qt.WA_TranslucentBackground, True)
-            panel_bg = "background: rgba(0,0,0,0.35);"
+        # Fenêtre translucide (overlay)
+        self.setAttribute(QtCore.Qt.WA_TranslucentBackground, True)
 
-        # Click-through (ToS-safe)
+        # Click-through par défaut (sécurisé pour la table)
+        self.interact_mode = False
         self.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, True)
 
-        # Plein écran par défaut (suivi table ensuite si activé)
+        # Zone par défaut : plein écran (on pourra suivre la table)
         self._set_fullscreen_geometry()
 
-        # --- UI ---
+        # --- UI principale ---
         font_h = QtGui.QFont("Segoe UI", 12, QtGui.QFont.Bold)
         font_b = QtGui.QFont("Segoe UI", 11)
 
@@ -207,12 +206,13 @@ class Overlay(QtWidgets.QWidget):
         self.mode_lbl = L(); self.perf_lbl = L()
 
         panel = QtWidgets.QFrame()
-        panel.setStyleSheet(f"{panel_bg} border-radius: 12px;")
+        panel.setObjectName("hudpanel")
+        panel.setStyleSheet(f"QFrame#hudpanel{{{PANEL_BG_CSS} border-radius: 12px;}}")
         v = QtWidgets.QVBoxLayout(panel); v.setContentsMargins(16,16,12,12); v.setSpacing(6)
         for w in [self.mode_lbl, self.hero, self.board, self.pot, self.stack, self.tocall, self.dealer, self.action, self.status, self.perf_lbl]:
             v.addWidget(w)
 
-        # Barre de confiance (fine)
+        # Barre de confiance
         self.confbar = QtWidgets.QProgressBar()
         self.confbar.setTextVisible(False)
         self.confbar.setRange(0, 100)
@@ -227,31 +227,25 @@ class Overlay(QtWidgets.QWidget):
         root.setContentsMargins(20,20,20,20)
         root.addWidget(panel, 0, QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
 
-        # Réfs de style pour appliquer la couleur selon l'action
+        # Style de base du panneau (pour les thèmes de conseils)
         self.panel = panel
-        self._panel_bg_style = panel.styleSheet()
+        self._panel_bg_style = self.panel.styleSheet()
+
+        # ==== Barre de titre (mode interaction) ====
+        self._setup_titlebar()
+        # ==========================================
 
         # Hotkeys HUD
-        self.shortcut_show  = QtGui.QShortcut(QtGui.QKeySequence("F8"), self)
-        self.shortcut_show.setContext(QtCore.Qt.ApplicationShortcut)
-        self.shortcut_show.activated.connect(self.toggle_visible)
+        self.shortcut_show  = QtGui.QShortcut(QtGui.QKeySequence("F8"), self, activated=self.toggle_visible)
+        self.shortcut_pause = QtGui.QShortcut(QtGui.QKeySequence("F9"), self, activated=self.toggle_pause)
+        self.shortcut_force = QtGui.QShortcut(QtGui.QKeySequence("F10"), self, activated=self.ask_now)
+        self.shortcut_mode  = QtGui.QShortcut(QtGui.QKeySequence("F11"), self, activated=self.toggle_mode)
+        self.shortcut_rois  = QtGui.QShortcut(QtGui.QKeySequence("F5"), self, activated=self.toggle_rois)
 
-        self.shortcut_pause = QtGui.QShortcut(QtGui.QKeySequence("F9"), self)
-        self.shortcut_pause.setContext(QtCore.Qt.ApplicationShortcut)
-        self.shortcut_pause.activated.connect(self.toggle_pause)
-
-        self.shortcut_force = QtGui.QShortcut(QtGui.QKeySequence("F10"), self)  # Demander conseil maintenant
-        self.shortcut_force.setContext(QtCore.Qt.ApplicationShortcut)
-        self.shortcut_force.activated.connect(self.ask_now)
-
-        self.shortcut_mode  = QtGui.QShortcut(QtGui.QKeySequence("F11"), self)  # AUTO <-> MANUEL
-        self.shortcut_mode.setContext(QtCore.Qt.ApplicationShortcut)
-        self.shortcut_mode.activated.connect(self.toggle_mode)
-
-        # Debug ROIs sur F5 (libère F7 pour lock)
-        self.shortcut_rois  = QtGui.QShortcut(QtGui.QKeySequence("F5"), self)
-        self.shortcut_rois.setContext(QtCore.Qt.ApplicationShortcut)
-        self.shortcut_rois.activated.connect(self.toggle_rois)
+        # 🔁 Mode interaction (F4) + fermer (F12/Échap)
+        self.shortcut_inter = QtGui.QShortcut(QtGui.QKeySequence("F4"), self, activated=self.toggle_interact)
+        self.shortcut_close = QtGui.QShortcut(QtGui.QKeySequence("F12"), self, activated=self.close)
+        self.shortcut_esc   = QtGui.QShortcut(QtGui.QKeySequence("Escape"), self, activated=self.close)
 
         # État interne
         self.paused = False
@@ -261,19 +255,75 @@ class Overlay(QtWidgets.QWidget):
         self.force_policy_once = False
         self.auto_mode = not MANUAL_ONLY
         self.show_rois = False
-        self._debug_rois = []        # pour paintEvent
-        self._last_table_rect = None # suivi de table
-        self._policy_cache = {}      # sig -> action
+        self._debug_rois = []
+        self._last_table_rect = None
+        self._policy_cache = {}
 
         self._refresh_mode_label()
-        self._tick_win_status(force=True)  # refresh immédiat
+        self._tick_win_status(force=True)
 
-        # Timer UI (tick principal pour OCR/policy)
+        # Timer principal
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self.tick)
         self.timer.start(REFRESH_MS)
 
-    # ------- geometry helpers -------
+    # ---------- Titlebar (interaction) ----------
+    def _setup_titlebar(self):
+        self.titlebar = QtWidgets.QFrame(self)
+        self.titlebar.setObjectName("titlebar")
+        self.titlebar.setFixedHeight(28)
+        self.titlebar.setStyleSheet(
+            "QFrame#titlebar{background: rgba(0,0,0,0.50); border-radius: 8px;}"
+            "QLabel{color:white; font-size:12px; padding-left:8px;}"
+            "QPushButton{color:white; background:transparent; border:none; font-size:14px; padding:2px 8px;}"
+            "QPushButton:hover{background: rgba(255,255,255,0.15); border-radius: 6px;}"
+        )
+        lay = QtWidgets.QHBoxLayout(self.titlebar)
+        lay.setContentsMargins(8,2,6,2); lay.setSpacing(6)
+        self.drag_lbl = QtWidgets.QLabel("⠿ Déplacer")
+        lay.addWidget(self.drag_lbl)
+        lay.addStretch(1)
+        self.btn_close = QtWidgets.QPushButton("×")
+        self.btn_close.clicked.connect(self.close)
+        lay.addWidget(self.btn_close)
+
+        self.titlebar.setVisible(False)  # visible seulement en mode interaction
+        self.titlebar.installEventFilter(self)
+        self._drag_active = False
+        self._drag_offset = QtCore.QPoint()
+
+    def resizeEvent(self, ev):
+        super().resizeEvent(ev)
+        # place la titlebar en haut-droite
+        w = 160
+        self.titlebar.setFixedWidth(w)
+        self.titlebar.move(self.width() - w - 12, 8)
+
+    def eventFilter(self, obj, ev):
+        if obj is self.titlebar and self.interact_mode:
+            if ev.type() == QtCore.QEvent.MouseButtonPress and ev.button() == QtCore.Qt.LeftButton:
+                self._drag_active = True
+                # offset entre curseur global et topleft fenêtre
+                gp = ev.globalPosition().toPoint() if hasattr(ev, "globalPosition") else ev.globalPos()
+                self._drag_offset = gp - self.frameGeometry().topLeft()
+                return True
+            if ev.type() == QtCore.QEvent.MouseMove and self._drag_active:
+                gp = ev.globalPosition().toPoint() if hasattr(ev, "globalPosition") else ev.globalPos()
+                self.move(gp - self._drag_offset)
+                return True
+            if ev.type() == QtCore.QEvent.MouseButtonRelease:
+                self._drag_active = False
+                return True
+        return super().eventFilter(obj, ev)
+
+    @QtCore.Slot()
+    def toggle_interact(self):
+        # ON: capture souris + titlebar visible ; OFF: click-through
+        self.interact_mode = not self.interact_mode
+        self.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, not self.interact_mode)
+        self.titlebar.setVisible(self.interact_mode)
+
+    # ---------- geometry helpers ----------
     def _set_fullscreen_geometry(self):
         screen_geo = QtGui.QGuiApplication.primaryScreen().geometry()
         self.setGeometry(screen_geo)
@@ -287,7 +337,49 @@ class Overlay(QtWidgets.QWidget):
         except Exception:
             pass
 
-    # ------- actions UI -------
+    # ---------- bandeau statut ----------
+    @QtCore.Slot()
+    def on_cycle_window(self):
+        LOCK.cycle()
+        self._tick_win_status(force=True)
+
+    @QtCore.Slot()
+    def on_toggle_lock(self):
+        LOCK.toggle_lock()
+        self._tick_win_status(force=True)
+
+    def _tick_win_status(self, force: bool=False):
+        st = LOCK.get_status()
+        paused = False
+        paused_reason = ""
+        if os.getenv("POKERIA_REQUIRE_FOREGROUND","1") == "1":
+            try:
+                if LOCK.is_minimized():
+                    paused = True; paused_reason = "minimized"
+                elif st.locked and not LOCK.is_foreground():
+                    paused = True; paused_reason = "not foreground"
+            except Exception:
+                pass
+
+        locked = bool(getattr(st, "locked", False))
+        room   = getattr(st, "room", "?") or "?"
+        title  = getattr(st, "title", "") or ""
+
+        status_icon = "🔒" if locked else "🧭"
+        pause_tag   = f" • ⏸ {paused_reason}" if paused else ""
+        full_text   = f"{status_icon} {room} • {title}{pause_tag}"
+
+        current_w = min(self.status_max_w, max(180, self.width() - 24))
+        if current_w != self.win_status.width():
+            self.win_status.setFixedWidth(current_w)
+        fm = self.win_status.fontMetrics()
+        elided = fm.elidedText(full_text, QtCore.Qt.ElideRight, current_w - 8)
+        self.win_status.setText(elided)
+
+        if force:
+            self.update()
+
+    # ---------- actions HUD ----------
     @QtCore.Slot()
     def toggle_visible(self):
         self.setVisible(not self.isVisible())
@@ -317,21 +409,20 @@ class Overlay(QtWidgets.QWidget):
     def _refresh_mode_label(self):
         self.mode_lbl.setText("Mode: " + ("AUTO" if self.auto_mode else "MANUEL"))
 
-    # ------- cycle -------
+    # ---------- cycle principal ----------
     @QtCore.Slot()
     def tick(self):
         if self.paused or self.busy:
             return
         self.busy = True
 
-        # throttle LLM en mode AUTO; en MANUEL jamais (sauf force)
         allow_policy = False
         now = time.monotonic()
         if self.auto_mode:
             allow_policy = (now - self.last_policy_ts) >= POLICY_PERIOD_S
 
         force_policy = self.force_policy_once
-        self.force_policy_once = False  # reset
+        self.force_policy_once = False
 
         self.thread = QtCore.QThread(self)
         self.worker = Worker(
@@ -356,12 +447,10 @@ class Overlay(QtWidgets.QWidget):
 
     @QtCore.Slot(object)
     def on_result(self, res: WorkResult):
-        # Suivre table si possible (via worker)
         if res.table_rect:
             self._last_table_rect = res.table_rect
             self._maybe_follow_roi(res.table_rect)
 
-        # Maj labels d'état
         self.hero.setText("Hero: " + (" ".join(res.hero) if res.hero else "—"))
         self.board.setText("Board: " + (" ".join(res.board) if res.board else "—"))
         self.pot.setText(f"Pot: {res.pot:.2f} €")
@@ -369,7 +458,6 @@ class Overlay(QtWidgets.QWidget):
         self.tocall.setText(f"A suivre: {res.to_call:.2f} €")
         self.dealer.setText(f"BTN seat: {res.dealer if res.dealer is not None else '—'}")
 
-        # Choix action : policy du worker OU cache
         a = None
         if res.action:
             a = res.action
@@ -377,10 +465,8 @@ class Overlay(QtWidgets.QWidget):
             self.last_policy_ts = time.monotonic()
         else:
             a = self._policy_cache.get(res.signature)
-
         self.last_sig = res.signature
 
-        # Affichage action + thème couleur + confiance
         if not a:
             self.action.setText("Action: —")
             self._apply_action_theme("none", 0.0)
@@ -397,21 +483,17 @@ class Overlay(QtWidgets.QWidget):
                 text += f"  ({sz:.2f} bb ~ {int(pr*100)}% pot)"
             text += f"   conf={int(cf*100)}%"
             self.action.setText(text)
-
             self._apply_action_theme(typ, cf)
 
-        # Status
         if res.policy_queried:
             self.status.setText("✅ Conseil mis à jour")
         else:
             self.status.setText("")
 
-        # Perf
         self.perf_lbl.setText(
             f"⏱ OCR {res.ocr_ms:.0f} ms" + (f" • IA {res.policy_ms:.0f} ms" if res.policy_ms else "")
         )
 
-        # Debug ROIs
         self._debug_rois = res.debug_rois if isinstance(res.debug_rois, list) else []
         if self.show_rois:
             self.update()
@@ -420,19 +502,15 @@ class Overlay(QtWidgets.QWidget):
     def on_error(self, msg: str):
         self.status.setText(f"ERR: {msg}")
 
-    # ------- thème couleur + confiance -------
+    # ---------- thème couleur + confiance ----------
     def _apply_action_theme(self, typ: str, conf: float):
         key = (typ or "none").lower()
         if key not in PALETTE:
             key = "none"
         color = PALETTE[key]["accent"]
 
-        # Bordure colorée + fond conservé
-        self.panel.setStyleSheet(
-            f"{self._panel_bg_style} border-left: 4px solid {color};"
-        )
+        self.panel.setStyleSheet(f"{self._panel_bg_style} border-left: 4px solid {color};")
 
-        # Jauge de confiance
         pct = max(0, min(int(conf * 100), 100))
         self.confbar.setValue(pct)
         self.confbar.setStyleSheet(
@@ -440,20 +518,16 @@ class Overlay(QtWidgets.QWidget):
             "border: 1px solid rgba(255,255,255,0.18); border-radius: 3px;}"
             f"QProgressBar::chunk{{background: {color}; border-radius: 3px;}}"
         )
-
-        # Texte: garder blanc (lisibilité sur fond sombre)
         self.action.setStyleSheet("color: white;")
 
-    # ------- dessin overlay (debug ROIs) -------
+    # ---------- debug ROIs ----------
     def paintEvent(self, ev):
         super().paintEvent(ev)
         if not self.show_rois or not self._debug_rois:
             return
         qp = QtGui.QPainter(self)
         qp.setRenderHint(QtGui.QPainter.Antialiasing, True)
-        pen = QtGui.QPen(QtCore.Qt.green)
-        pen.setWidth(2)
-        qp.setPen(pen)
+        pen = QtGui.QPen(QtCore.Qt.green); pen.setWidth(2); qp.setPen(pen)
         for roi in self._debug_rois:
             try:
                 x, y, w, h, label = roi
@@ -463,44 +537,9 @@ class Overlay(QtWidgets.QWidget):
             qp.drawText(int(x)+3, int(y)+14, str(label))
         qp.end()
 
-    # ------- Fenêtrage / LOCK (raccourcis + statut) -------
-    @QtCore.Slot()
-    def on_cycle_window(self):
-        LOCK.cycle()
-        self._tick_win_status(force=True)
-
-    @QtCore.Slot()
-    def on_toggle_lock(self):
-        LOCK.toggle_lock()
-        self._tick_win_status(force=True)
-
-    def _tick_win_status(self, force: bool=False):
-        st = LOCK.get_status()
-        paused = False
-        paused_reason = ""
-        if os.getenv("POKERIA_REQUIRE_FOREGROUND","1") == "1":
-            try:
-                if LOCK.is_minimized():
-                    paused = True; paused_reason = "minimized"
-                elif st.locked and not LOCK.is_foreground():
-                    paused = True; paused_reason = "not foreground"
-            except Exception:
-                pass
-
-        status = "LOCKED" if getattr(st, "locked", False) else "FOLLOW"
-        if paused:
-            status += f" | PAUSED ({paused_reason})"
-
-        room = getattr(st, "room", "?")
-        title = (getattr(st, "title", "") or "")[:80]
-        self.win_status.setText(f"Room: {room} | Window: {title} | {status}")
-
-        if force:
-            self.update()
-
 
 def run():
-    # ✅ Forcer OpenGL logiciel AVANT la création de QApplication
+    # OpenGL logiciel AVANT QApplication (compatibilité)
     if os.getenv("POKERIA_USE_SOFTGL", "1") == "1":
         QtCore.QCoreApplication.setAttribute(QtCore.Qt.AA_UseSoftwareOpenGL, True)
 

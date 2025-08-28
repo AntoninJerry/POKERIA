@@ -1,10 +1,10 @@
 room: winamax
 dpi_scale: 1.0
 table_roi:
-  left: 5
-  top: 24
-  width: 1667
-  height: 1011
+  left: 232
+  top: 217
+  width: 831
+  height: 626
 rois_hint:
   hero_card_left:
     rel:

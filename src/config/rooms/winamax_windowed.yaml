@@ -1,0 +1,8 @@
+room: winamax_windowed
+dpi_scale: 1.0
+table_roi:
+  left: 100
+  top: 100
+  width: 1280
+  height: 720
+rois_hint: {}
