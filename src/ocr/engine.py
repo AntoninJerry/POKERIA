@@ -1,6 +1,7 @@
 # src/ocr/engine.py
 from __future__ import annotations
 import re
+import os
 import numpy as np
 from typing import Optional, Dict, Any, List, Tuple
 
@@ -10,21 +11,36 @@ class EasyOCREngine:
       - read_text(img_rgb, allowlist=None) → (txt, conf, raw)
       - read_amount(img_rgb, prefer_rightmost=True) → dict {text,value,conf,raw,joined}
       - read_amount_from_variants(variants) → garde le meilleur des prétraitements
+      - warmup() → charge les poids une fois (évite le pic à la 1ère requête)
     """
-    def __init__(self, gpu: bool = False, langs: List[str] = ('en',)):
-        # import tardif pour éviter le coût si module non utilisé ailleurs
+    def __init__(self, gpu: bool | None = None, langs: List[str] = ("en",)):
+        # Choix GPU automatique si demandé + dispo
+        if gpu is None:
+            use_env = os.getenv("POKERIA_OCR_GPU", "auto")  # "1"/"0"/"auto"
+            if use_env in {"1", "true", "TRUE"}:
+                try:
+                    import torch
+                    gpu = bool(getattr(torch, "cuda", None) and torch.cuda.is_available())
+                except Exception:
+                    gpu = False
+            elif use_env in {"0", "false", "FALSE"}:
+                gpu = True
+            else:
+                try:
+                    import torch
+                    gpu = bool(getattr(torch, "cuda", None) and torch.cuda.is_available())
+                except Exception:
+                    gpu = True
+        # Import tardif → charge les poids seulement si nécessaire
         import easyocr
-        # model_storage_directory: dossier local (évite re-download)
         self.reader = easyocr.Reader(
-            list(langs), gpu=gpu, download_enabled=True, model_storage_directory='models/'
+            list(langs), gpu=bool(gpu), download_enabled=True, model_storage_directory='models/'
         )
 
     # ─────────── helpers parsing ───────────
     @staticmethod
     def _postfix_common_ocr_errors(s: str) -> str:
-        """
-        Corrections simples pour confusions fréquentes.
-        """
+        """Corrections simples pour confusions fréquentes."""
         return (
             s.replace('O', '0')
              .replace('o', '0')
@@ -35,9 +51,7 @@ class EasyOCREngine:
 
     @staticmethod
     def _parse_amount(txt: str) -> Optional[float]:
-        """
-        '1.234,56' → 1234.56 ; '12,3' → 12.3 ; '12.3' → 12.3
-        """
+        """'1.234,56' → 1234.56 ; '12,3' → 12.3 ; '12.3' → 12.3"""
         if not txt:
             return None
         t = EasyOCREngine._postfix_common_ocr_errors(txt)
@@ -56,10 +70,7 @@ class EasyOCREngine:
 
     # ─────────── API OCR générique ───────────
     def read_text(self, img_rgb, allowlist: Optional[str] = None) -> Tuple[str, float, list]:
-        """
-        Retourne (texte_concaténé, confiance_moyenne, résultats_bruts).
-        """
-        # EasyOCR attend 3 canaux; si binaire 1 canal, il gère mais on laisse simple ici.
+        """Retourne (texte_concaténé, confiance_moyenne, résultats_bruts)."""
         kw = dict(detail=1, paragraph=False)
         if allowlist is not None:
             kw["allowlist"] = allowlist
@@ -113,7 +124,6 @@ class EasyOCREngine:
             })
 
         if candidates:
-            # tri multi-clés
             candidates.sort(key=lambda d: (
                 not d["has_dec"],
                 -d["x"] if prefer_rightmost else d["x"],
@@ -129,21 +139,27 @@ class EasyOCREngine:
             }
 
         # fallback: concat global
-        txt, conf, raw = self.read_text(img_rgb, allowlist="0123456789€,.")
+        txt, conf, raw = self.read_text(img_rgb, allowlist="0123456789€+.,-")
         val = self._parse_amount(txt)
         return {"text": txt, "value": val, "conf": conf, "raw": raw, "joined": txt}
 
     def read_amount_from_variants(self, variants: List[np.ndarray], prefer_rightmost: bool = True) -> Dict[str, Any]:
-        """
-        Donne plusieurs versions prétraitées (binaire/upscale) → renvoie la meilleure lecture.
-        """
+        """Donne plusieurs versions prétraitées → renvoie la meilleure lecture."""
         best: Dict[str, Any] = {"conf": -1.0, "value": None}
         for v in variants:
             out = self.read_amount(v, prefer_rightmost=prefer_rightmost)
-            # priorité à une valeur non-nulle et/ou meilleure confiance
             score = (1 if out.get("value") is not None else 0, float(out.get("conf", 0.0)))
             if score > (1 if best.get("value") is not None else 0, float(best.get("conf", 0.0))):
                 best = out
         if best["conf"] < 0:  # rien lu
             return {"text": "", "value": None, "conf": 0.0, "raw": [], "joined": ""}
         return best
+
+    # ─────────── Warmup ───────────
+    def warmup(self):
+        try:
+            import numpy as np
+            dummy = np.zeros((20, 80, 3), dtype=np.uint8)
+            self.read_text(dummy, allowlist="0123456789TJQKAhdsc€.,-")
+        except Exception:
+            pass

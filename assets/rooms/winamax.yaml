@@ -138,3 +138,18 @@ rois_hint:
     - 0.073195
 table_meta:
   seats_n: 5
+ocr:
+  cards:
+    strict: true                # héros strict
+    board_tolerant: true        # tolérance activée pour board
+    min_rank_conf: 0.92
+    min_suit_conf: 0.85
+    min_card_score: 0.35
+    min_edge_density: 0.012
+    min_white_ratio: 0.04
+
+    # seuils spécifiques board (plus permissifs)
+    min_rank_conf_board: 0.90
+    min_suit_conf_board: 0.55
+    min_card_score_board: 0.25
+    min_white_ratio_board: 0.02

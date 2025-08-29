@@ -1,7 +1,22 @@
 # src/ocr/preprocess.py
 from __future__ import annotations
+import os
 import cv2
 import numpy as np
+
+# ──────────────────────────
+# Optimisations globales OpenCV / BLAS (une fois)
+# ──────────────────────────
+try:
+    cv2.setUseOptimized(True)
+    try:
+        cv2.setNumThreads(max(1, os.cpu_count()//2))
+    except Exception:
+        pass
+    os.environ.setdefault("OMP_NUM_THREADS", "4")
+    os.environ.setdefault("MKL_NUM_THREADS", "4")
+except Exception:
+    pass
 
 # ──────────────────────────
 # Conversions de base
@@ -71,6 +86,43 @@ def _scale_to_height(img: np.ndarray, target_h: int = 64) -> np.ndarray:
     return cv2.resize(img, (new_w, target_h), interpolation=cv2.INTER_CUBIC)
 
 # ──────────────────────────
+# Indicateurs de présence / couleur (pour abstention)
+# ──────────────────────────
+def red_ratio(img_rgb: np.ndarray) -> float:
+    b,g,r = cv2.split(img_rgb)
+    rr = (r.astype(np.int32) - ((g.astype(np.int32)+b.astype(np.int32))//2))
+    rr = np.clip(rr, 0, 255).astype(np.uint8)
+    return float((rr > 30).mean())
+
+def card_presence_score(img_rgb: np.ndarray, min_edge_density: float = 0.012, min_white_ratio: float = 0.04) -> tuple[float, bool]:
+    """
+    Renvoie (score, present_bool).
+    Score combine: bordures (Canny), blancs (cadre de carte), aire contour max.
+    """
+    h, w = img_rgb.shape[:2]
+    if h*w == 0:
+        return 0.0, False
+
+    gray = to_gray(img_rgb)
+    white = (gray > 210).astype(np.uint8)
+    white_ratio = float(white.mean())
+
+    edges = cv2.Canny(gray, 55, 110)
+    edge_density = float(edges.mean()) / 255.0
+
+    cnts, _ = cv2.findContours((gray > 160).astype(np.uint8), cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    max_area = 0.0
+    for c in cnts:
+        a = cv2.contourArea(c)
+        if a > max_area:
+            max_area = a
+    area_ratio = float(max_area) / (h*w)
+
+    score = 0.5*edge_density + 0.35*white_ratio + 0.15*area_ratio
+    ok = (edge_density >= min_edge_density) and (white_ratio >= min_white_ratio)
+    return float(score), bool(ok)
+
+# ──────────────────────────
 # Pipeline montants (pot / stack)
 # ──────────────────────────
 def preprocess_digits(img_rgb: np.ndarray) -> np.ndarray:
@@ -92,10 +144,7 @@ def preprocess_digits(img_rgb: np.ndarray) -> np.ndarray:
     return th
 
 def preprocess_digits_variants(img_rgb: np.ndarray) -> list[np.ndarray]:
-    """
-    Génère plusieurs binaires agrandis pour tenter l’OCR
-    et garder le meilleur en aval (read_amount).
-    """
+    """Génère plusieurs binaires agrandis pour tenter l’OCR et garder la meilleure."""
     gray = to_gray(img_rgb)
     base = _clahe(_unsharp(gray, k=5, amount=1.0))
 

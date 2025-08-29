@@ -4,6 +4,8 @@ import os, cv2, numpy as np
 from pathlib import Path
 from typing import Optional, Tuple, Dict, List
 
+# NB: ce module est léger; il charge les templates une seule fois.
+
 def _default_suits_dir() -> Path:
     here = Path(__file__).resolve()
     repo = here.parents[2]  # .../pokeria/
